@@ -1,0 +1,572 @@
+"""Speech-to-text via faster-whisper, fully local.
+
+Model load is O(model size) and happens once. Per-call cost is dominated by the
+whisper encoder/decoder over the clip, which is roughly O(audio_seconds) with a
+large constant; the joining and gating loops are O(segments). Language detection
+is one extra O(1) encoder pass, and phrase folding is O(len(text)). Nothing here
+scales super-linearly with audio length.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import re
+import sys
+from dataclasses import dataclass, field
+
+import numpy as np
+
+log = logging.getLogger("transcribe")
+
+SAMPLE_RATE = 16000
+EMPTY_AUDIO_FLOOR = 1e-4
+
+_DLL_HANDLES: list = []
+
+#: No vocabulary ships with the app. The words that need rescuing are the
+#: speaker's own, so a generic list would only be noise; terms come from the
+#: tray editor or from the CorrectionLearner. Keep any list SHORT: measured on
+#: a real 3-sentence dictation, a 29-term list scored 48.1% WER while a 10-term
+#: list scored 37.0% on the same audio. A long prompt skews the language model
+#: and damages ORDINARY words, so add terms deliberately, not pre-emptively.
+DEFAULT_VOCABULARY = ""
+# Average WER on the HuggingFace Open ASR Leaderboard English short-form set:
+# turbo 7.83, large-v3 7.44, distil-large-v3 7.21. Turbo trades accuracy for
+# speed, and this machine has speed to spare (RTF 0.07), so prefer v3. The
+# gap is much larger on noisy and accented speech (VoxPopuli: turbo 11.87 vs
+# v3 9.54), which is the case that matters here.
+V3_MODEL = "Systran/faster-whisper-large-v3"
+DISTIL_MODEL = "Systran/faster-distil-whisper-large-v3"
+TURBO_MODEL = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+SMALL_MODEL = "Systran/faster-whisper-small.en"
+# The multilingual sibling of SMALL_MODEL. small.en is faster and more accurate
+# on English, but it cannot produce any other language at all: it reports
+# supported_languages == ["en"]. When the configured language is not exactly
+# English, the CPU fallback must therefore be this model.
+SMALL_MULTI_MODEL = "Systran/faster-whisper-small"
+
+# The sentinel meaning "let the model decide", shared with config.DEFAULTS.
+LANGUAGE_AUTO = "auto"
+
+DEFAULT_BEAM = 5
+_FALLBACK_BEAM = 1
+
+# A window longer than 30 s silently degrades: whisper was trained on 30 s
+# chunks and slides a 30 s window, so a bad window poisons its successor.
+MAX_WINDOW_SECONDS = 30.0
+
+# Whisper hallucinates on non-speech. Barański 2025 (arXiv:2501.11378) measured
+# 40.3% of 301,317 non-speech clips producing text, and the training-data
+# artefacts below dominate the output.
+HALLUCINATIONS = (
+    "thank you for watching",
+    "thanks for watching",
+    "thank you for listening",
+    "thanks for listening",
+    "please subscribe",
+    "subscribe to my channel",
+    "subtitles by",
+    "amara.org",
+    "transcription by",
+    "you",
+)
+
+# The training-data artefacts whisper emits on non-speech are language-specific:
+# an English list catches none of the Chinese "thanks for watching" clones. These
+# are the phrases observed on real non-speech clips, kept raw and folded at match
+# time so punctuation and spacing cannot hide them.
+HALLUCINATIONS_BY_LANGUAGE: dict[str, tuple[str, ...]] = {
+    "zh": (
+        "谢谢观看",
+        "謝謝觀看",
+        "感谢观看",
+        "下集预告",
+        "别忘了订阅",
+        "记得订阅",
+        "大家好 欢迎来到我的频道",
+        "字幕由amara org社区提供",
+        "本集完",
+        "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目",
+    ),
+    "ja": (
+        "ご視聴ありがとうございました",
+        "見てくれてありがとう",
+    ),
+    "th": (
+        "ขอบคุณครับ",
+        "ขอบคุณที่รับชม",
+        "โปรดติดตามตอนต่อไป",
+    ),
+    "vi": (
+        "cảm ơn các bạn đã xem video này",
+        "hãy đăng ký kênh để ủng hộ mình nhé",
+        "hẹn gặp lại các bạn trong những video tiếp theo",
+        "các bạn nhớ đăng kí kênh để ủng hộ kênh",
+    ),
+    "id": (
+        "terima kasih telah menonton",
+        "terima kasih sudah menonton jangan lupa subscribe like",
+    ),
+    "fr": ("merci d'avoir regardé cette vidéo",),
+    "es": (
+        "gracias por ver el video",
+        "críbete al canal gracias",
+    ),
+}
+
+# Fold a phrase to a compact match key: case-folded, whitespace-free, and stripped
+# of everything that is not a letter or digit. \w is already Unicode-aware for
+# str patterns; the explicit CJK, kana and Thai ranges keep the intent legible.
+_NON_WORD = re.compile(r"[^\w\u4e00-\u9fff\u3040-\u30ff\u0e00-\u0e7f]")
+
+
+def fold_phrase(text) -> str:
+    """The exact-match key for a hallucination phrase or a whole transcript.
+
+    Case-folds, removes all whitespace, and drops every non-word character, so
+    punctuation and spacing cannot hide a filler phrase. CJK, kana and Thai
+    letters survive. O(len(text)) time and space.
+    """
+    return _NON_WORD.sub("", str(text).casefold())
+
+
+# Folded once at import: the union of the English list and every language list.
+# Membership is a whole-transcript exact match, never a substring, so an ordinary
+# sentence that merely contains a phrase is not caught.
+_HALLUCINATION_KEYS = frozenset(fold_phrase(phrase) for phrase in HALLUCINATIONS) | frozenset(
+    fold_phrase(phrase)
+    for phrases in HALLUCINATIONS_BY_LANGUAGE.values()
+    for phrase in phrases
+)
+
+NO_SPEECH_PROB = 0.5
+NO_SPEECH_LOGPROB = -0.5
+BAD_LOGPROB = -1.0
+BAD_COMPRESSION = 2.2
+
+
+def enable_cuda_dlls() -> list:
+    """Make the pip-installed CUDA runtime visible to CTranslate2.
+
+    CTranslate2 loads cublas64_12.dll and cudnn64_9.dll through the normal DLL
+    search path, which does not include site-packages. Returns the handles, which
+    must stay referenced for the lifetime of the process or Windows unloads the
+    directories again.
+    """
+    import os
+    from pathlib import Path
+
+    global _DLL_HANDLES
+    if _DLL_HANDLES:
+        return _DLL_HANDLES
+    try:
+        import nvidia
+    except ImportError:
+        return _DLL_HANDLES
+
+    roots = [Path(entry) for entry in list(getattr(nvidia, "__path__", []) or [])]
+    additions: list[str] = []
+    for base in roots:
+        for package in ("cublas", "cudnn", "cuda_nvrtc"):
+            for sub in ("bin", "lib"):
+                candidate = base / package / sub
+                if candidate.is_dir():
+                    additions.append(str(candidate))
+    if not additions:
+        return _DLL_HANDLES
+
+    os.environ["PATH"] = os.pathsep.join(additions + [os.environ.get("PATH", "")])
+    for directory in additions:
+        try:
+            _DLL_HANDLES.append(os.add_dll_directory(directory))
+        except Exception as exc:
+            log.warning("could not add %s to the DLL path: %s", directory, exc)
+    return _DLL_HANDLES
+
+
+def _cuda_device_count() -> int:
+    try:
+        import ctranslate2
+
+        return int(ctranslate2.get_cuda_device_count())
+    except Exception:
+        return 0
+
+
+def normalise_language_code(value) -> str | None:
+    """A lowercase base language code, or None meaning "let the model decide".
+
+    Empty, None, and the sentinels "auto"/"none" all return None. A region or
+    script suffix is stripped ("en-US" -> "en", "zh_Hans" -> "zh"). O(len(value)).
+    """
+    if value is None:
+        return None
+    text = str(value).strip().casefold()
+    if not text or text in (LANGUAGE_AUTO, "none"):
+        return None
+    base = re.split(r"[-_]", text, maxsplit=1)[0].strip()
+    return base or None
+
+
+def resolve_engine(config) -> tuple[str, str, str]:
+    """Which model and device to try first, honouring explicit settings.
+
+    "auto" prefers the GPU and the most accurate locally-runnable model. Measured
+    on this machine: turbo at beam 5 runs at RTF 0.07 on CUDA against 2.28 on
+    CPU, so the GPU is what makes a large model practical at all. On CPU a
+    language of exactly "en" keeps the smaller English-only model, while "auto"
+    or any other language needs the multilingual small model.
+    """
+    device = str(config.get("device") or "auto").lower()
+    if device not in ("cpu", "cuda"):
+        device = "auto"
+    if device == "auto":
+        device = "cuda" if _cuda_device_count() else "cpu"
+
+    model = str(config.get("model_name") or "auto")
+    if model in ("auto", "", "None"):
+        if device == "cuda":
+            model = V3_MODEL
+        else:
+            language = normalise_language_code(config.get("language"))
+            model = SMALL_MODEL if language == "en" else SMALL_MULTI_MODEL
+
+    compute = str(config.get("compute_type") or "auto").lower()
+    if compute not in ("int8", "float16", "int8_float16", "float32"):
+        compute = "float16" if device == "cuda" else "int8"
+    return model, device, compute
+
+
+def vocabulary_for(config) -> str:
+    """The user's own terms, or an empty string when none are set.
+
+    Measured with Windows SAPI speech: with no biasing a project name survived 5
+    times out of 6 (heard as an ordinary word), and passing the same list as
+    ``hotwords`` took that to 10 out of 10, all exact. With no list configured
+    there is nothing to bias, which is the honest default.
+    """
+    return (config.get("custom_vocabulary") or "").strip() or DEFAULT_VOCABULARY
+
+
+def hotwords_for(config, language: str = "en") -> str:
+    """Shape the vocabulary into a prompt for the chosen language.
+
+    Wrapped so the tail-biased ordering in ``vocabulary`` is used when available
+    without importing it at module load (``vocabulary`` imports this module).
+    English keeps the measured prose frame; every other language gets a bare term
+    list, because an English prompt steers decoding back into English.
+    O(n log n) inside ``vocabulary``.
+    """
+    try:
+        from vocabulary import hotwords_for as _build
+
+        return _build(config, language=language)
+    except Exception as exc:
+        log.warning("falling back to the plain vocabulary list: %s", exc)
+        return vocabulary_for(config)
+
+
+@dataclass
+class Result:
+    """One transcription, with the confidence evidence behind it."""
+
+    text: str = ""
+    reject_reason: str | None = None
+    avg_logprob: float | None = None
+    no_speech_prob: float | None = None
+    compression_ratio: float | None = None
+    temperature: float | None = None
+    audio_seconds: float = 0.0
+    segments: int = 0
+    language: str = ""
+    language_probability: float | None = None
+    language_detected: bool = False
+    notes: list = field(default_factory=list)
+
+    @property
+    def accepted(self) -> bool:
+        return self.reject_reason is None and bool(self.text)
+
+
+class Transcriber:
+    def __init__(self, bus, config) -> None:
+        self.bus = bus
+        self.config = config
+        self._model = None
+        self._model_key: tuple | None = None
+        self._beam = int(config.get("beam_size") or DEFAULT_BEAM)
+
+    def _key(self) -> tuple:
+        return resolve_engine(self.config)
+
+    @property
+    def engine_name(self) -> str:
+        """The loaded model's repository name, or "" before a load."""
+        return self._model_key[0] if self._model_key else ""
+
+    def detect_language(self, audio) -> tuple[str, float]:
+        """The model's own single-segment language guess, and never an exception.
+
+        Returns ("", 0.0) when the model is not loaded, exposes no detector, or
+        the detection itself fails, so the caller can fall back to the language
+        whisper reports on ``info``. One encoder pass; O(1) beyond that.
+        """
+        detector = getattr(self._model, "detect_language", None)
+        if detector is None:
+            log.warning("the loaded model has no detect_language; language stays unknown")
+            return ("", 0.0)
+        try:
+            code, probability, _all_probs = detector(
+                audio=audio,
+                language_detection_segments=1,
+                language_detection_threshold=0.5,
+            )
+            return (str(code or ""), float(probability))
+        except Exception as exc:
+            log.warning("language detection failed: %s", exc)
+            return ("", 0.0)
+
+    def _resolve_language(self, audio: np.ndarray) -> tuple[str | None, float | None, bool]:
+        """Decide what ``language`` to pass to whisper, and what to record.
+
+        A configured code wins with no detection call, unless the loaded model
+        does not support it, in which case it degrades to auto rather than
+        raising. Auto detection is O(1) and fail-open: on failure whisper is left
+        to choose and the ``info`` object fills the result in. O(len(code)).
+        """
+        configured = normalise_language_code(self.config.get("language"))
+        if configured is not None:
+            supported = getattr(self._model, "supported_languages", None)
+            if supported and configured not in supported:
+                log.warning(
+                    "configured language %r is not supported by %s; using auto detection",
+                    configured, self.engine_name or "the model",
+                )
+            else:
+                log.info("using the configured language %r", configured)
+                return (configured, None, False)
+
+        code, probability = self.detect_language(audio)
+        if not code:
+            log.warning("language detection yielded nothing; letting whisper decide")
+            return (None, None, False)
+        if probability < 0.5:
+            log.warning(
+                "auto-detected language %r with low probability %.3f; keeping it",
+                code, probability,
+            )
+        else:
+            log.info("auto-detected language %r (p=%.3f)", code, probability)
+        return (code, probability, True)
+
+    def load(self) -> None:
+        """Load the preferred engine, or a safe fallback if it cannot run.
+
+        A cached model must never hit the network: this machine has a metered
+        connection and the app is expected to work with no internet. Only a
+        model that is genuinely absent is downloaded, once.
+        """
+        from faster_whisper import WhisperModel
+
+        key = self._key()
+        if self._model is not None and self._model_key == key:
+            return
+
+        beam = int(self.config.get("beam_size") or DEFAULT_BEAM)
+        # The safe CPU fallback must be able to produce every configured language:
+        # small.en cannot emit anything but English, so a non-English setting
+        # falls back to the multilingual small model first, then to small.en.
+        language = normalise_language_code(self.config.get("language"))
+        cpu_model = SMALL_MODEL if language == "en" else SMALL_MULTI_MODEL
+        attempts: list[tuple] = []
+        for attempt in (
+            (*key, beam),
+            (cpu_model, "cpu", "int8", _FALLBACK_BEAM),
+            (SMALL_MODEL, "cpu", "int8", _FALLBACK_BEAM),
+        ):
+            if attempt not in attempts:
+                attempts.append(attempt)
+        last_error: Exception | None = None
+        for model_name, device, compute_type, attempt_beam in attempts:
+            if device == "cuda":
+                enable_cuda_dlls()
+            try:
+                self._model = WhisperModel(
+                    model_name, device=device, compute_type=compute_type,
+                    local_files_only=True,
+                )
+            except Exception as exc:
+                last_error = exc
+                log.warning(
+                    "engine %s on %s/%s failed (%s); trying the fallback",
+                    model_name, device, compute_type, exc,
+                )
+                continue
+            self._model_key = (model_name, device, compute_type)
+            self._beam = attempt_beam
+            log.info(
+                "engine: %s on %s/%s, beam %s",
+                model_name, device, compute_type, attempt_beam,
+            )
+            return
+
+        raise RuntimeError(
+            f"no usable speech model: {last_error}. If a model is genuinely absent, "
+            "download it deliberately with: python tools/fetch_model.py --model small"
+        )
+
+    def warm_up(self) -> None:
+        """Load the model and decode one silent second so the first dictation is not slow.
+
+        Failures are reported on the bus rather than raised: this runs on a
+        background thread at startup and must not take the app down.
+        """
+        try:
+            self.load()
+            self.transcribe_audio(np.zeros(SAMPLE_RATE, dtype=np.float32))
+        except Exception as exc:
+            log.exception("warm-up failed")
+            self.bus.transcription_error.emit(f"Speech model failed to load: {exc}")
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        """Convenience wrapper returning just the text. Blocking."""
+        return self.transcribe_audio(audio).text
+
+    def transcribe_audio(self, audio: np.ndarray) -> Result:
+        """Transcribe and decide whether the result is trustworthy.
+
+        Blocking; call from a worker thread. A result is REJECTED rather than
+        returned when the model's own confidence says the audio was not speech,
+        because inserting a hallucination is far worse than asking the user to
+        repeat themselves. The thresholds and their sources are documented on the
+        module constants.
+        """
+        if audio is None or audio.size == 0:
+            return Result(reject_reason="nothing to transcribe")
+        audio = np.ascontiguousarray(audio, dtype=np.float32)
+        seconds = float(audio.size) / SAMPLE_RATE
+        if float(np.max(np.abs(audio))) < EMPTY_AUDIO_FLOOR:
+            return Result(reject_reason="the recording is silent", audio_seconds=seconds)
+        if seconds < 0.30:
+            return Result(reject_reason="too short to contain speech", audio_seconds=seconds)
+
+        self.load()
+        chosen_language, detected_probability, language_detected = self._resolve_language(audio)
+        segments, info = self._model.transcribe(
+            audio,
+            language=chosen_language,
+            multilingual=bool(self.config.get("detect_per_segment")),
+            beam_size=self._beam,
+            condition_on_previous_text=bool(self.config.get("condition_on_previous", True)),
+            prompt_reset_on_temperature=0.5,
+            vad_filter=bool(self.config.get("vad_filter", False)),
+            vad_parameters=dict(
+                threshold=0.5,
+                min_speech_duration_ms=250,
+                min_silence_duration_ms=500,
+                speech_pad_ms=200,
+                max_speech_duration_s=MAX_WINDOW_SECONDS - 2.0,
+            ),
+            hotwords=hotwords_for(self.config, chosen_language or "") or None,
+            no_speech_threshold=NO_SPEECH_PROB,
+            log_prob_threshold=BAD_LOGPROB,
+            compression_ratio_threshold=BAD_COMPRESSION,
+            word_timestamps=False,
+            without_timestamps=True,
+        )
+
+        pieces = []
+        logprobs = []
+        no_speech = []
+        compressions = []
+        temperatures = []
+        for segment in segments:
+            pieces.append(segment.text)
+            if segment.avg_logprob is not None:
+                logprobs.append(float(segment.avg_logprob))
+            if segment.no_speech_prob is not None:
+                no_speech.append(float(segment.no_speech_prob))
+            if segment.compression_ratio is not None:
+                compressions.append(float(segment.compression_ratio))
+            if getattr(segment, "temperature", None) is not None:
+                temperatures.append(float(segment.temperature))
+
+        text = " ".join(piece.strip() for piece in pieces if piece.strip()).strip()
+
+        # With no detected code, whisper picked the language itself and its info
+        # object carries the guess; otherwise the code chosen above is the truth.
+        if chosen_language:
+            result_language = chosen_language
+            result_probability = detected_probability
+            result_detected = language_detected
+        else:
+            result_language = str(getattr(info, "language", "") or "")
+            info_probability = getattr(info, "language_probability", None)
+            result_probability = (
+                float(info_probability) if info_probability is not None else None
+            )
+            result_detected = False
+
+        result = Result(
+            text=text,
+            avg_logprob=min(logprobs) if logprobs else None,
+            no_speech_prob=max(no_speech) if no_speech else None,
+            compression_ratio=max(compressions) if compressions else None,
+            temperature=max(temperatures) if temperatures else None,
+            audio_seconds=seconds,
+            segments=len(pieces),
+            language=result_language,
+            language_probability=result_probability,
+            language_detected=result_detected,
+        )
+
+        if not text:
+            result.reject_reason = "no words were recognised"
+            return result
+
+        if fold_phrase(text) in _HALLUCINATION_KEYS:
+            result.reject_reason = f"recognised the filler phrase {text.strip()!r}"
+            return result
+
+        if result.compression_ratio is not None and result.compression_ratio >= BAD_COMPRESSION:
+            result.reject_reason = "the output was repetitive, so it is not a real transcription"
+            return result
+
+        if result.avg_logprob is not None and result.avg_logprob < BAD_LOGPROB:
+            result.reject_reason = "the model was not confident enough in any of it"
+            return result
+
+        if (
+            result.no_speech_prob is not None
+            and result.avg_logprob is not None
+            and result.no_speech_prob >= NO_SPEECH_PROB
+            and result.avg_logprob < NO_SPEECH_LOGPROB
+        ):
+            result.reject_reason = "the recording does not contain speech"
+            return result
+
+        if (
+            result.temperature is not None
+            and result.temperature > 0.0
+            and result.avg_logprob is not None
+            and result.avg_logprob < BAD_LOGPROB / 2
+        ):
+            result.reject_reason = "the model had to guess, so the words are unreliable"
+            return result
+
+        return result
+
+
+def estimate_confidence(result: Result) -> float:
+    """A 0..1 score from the evidence, used only for logging and display.
+
+    Combines the model's mean log probability with the no-speech probability.
+    Linear in the number of segments; O(1) here because they are already reduced.
+    """
+    if result.avg_logprob is None:
+        return 0.0
+    probability = math.exp(min(result.avg_logprob, 0.0))
+    if result.no_speech_prob is not None:
+        probability *= 1.0 - min(max(result.no_speech_prob, 0.0), 1.0)
+    return max(0.0, min(1.0, probability))

@@ -1,0 +1,14 @@
+# Virtualenv and caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local-only data: recordings, captured samples, regenerable screenshots
+tools/lang_samples/
+tools/voice_samples/
+tools/runs/
+tools/shots/
+*.log

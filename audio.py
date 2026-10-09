@@ -35,6 +35,7 @@ import math
 import sys
 import threading
 import time
+from collections import deque
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -50,6 +51,10 @@ HOP_MS = 10.0
 MIN_LEVEL_DB = -60.0
 EMIT_INTERVAL_S = 0.016
 ENERGY_FLOOR = 1e-9
+#: Seconds of always-on audio kept ahead of a recording. The Intel array's first
+#: words arrive late (see ``Recorder``); buffering the moments before the keypress
+#: recovers the lead-in and the hotkey-to-capture latency.
+PREROLL_SECONDS = 1.5
 
 BAND_EDGES = (
     (80, 300),
@@ -468,6 +473,30 @@ def trim_silence(
     return np.ascontiguousarray(arr[start:end], dtype=np.float32)
 
 
+def salvage_quiet(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+    """Recover a clip that adaptive trimming emptied but that still holds signal.
+
+    The Intel Smart Sound array delivers the first word or two of an utterance
+    quietly (its noise-suppression gate is still opening), so the adaptive
+    threshold can decide every frame is silence and ``trim_silence`` returns
+    empty - the dictation is then dropped as "no speech". When the raw clip's
+    peak is at or above the true-silence floor, this re-trims with that fixed
+    floor instead of the adaptive one, so quiet-but-real speech survives. A clip
+    that is genuinely silent (peak below -60 dBFS) still returns empty, and
+    Whisper's own no-speech gate rejects anything this lets through.
+
+    Time: O(n). Space: O(n).
+    """
+    arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return np.empty(0, dtype=np.float32)
+    if float(np.max(np.abs(arr))) < _amplitude_from_db(MIN_LEVEL_DB):
+        return np.empty(0, dtype=np.float32)
+    return trim_silence(
+        arr, sample_rate=sample_rate, threshold_db=MIN_LEVEL_DB, adaptive=False
+    )
+
+
 def dbfs_to_level(db: float, floor_db: float = MIN_LEVEL_DB) -> float:
     """Map a dBFS value onto 0.0..1.0 with clamping.
 
@@ -532,6 +561,8 @@ class Recorder:
         self._samples = 0
         self._recording = False
         self._last_emit = 0.0
+        self._preroll: deque[np.ndarray] = deque()
+        self._preroll_samples = 0
 
     @property
     def is_recording(self) -> bool:
@@ -549,22 +580,29 @@ class Recorder:
     def prime(self) -> None:
         """Open the stream and leave it open without buffering, when configured.
 
-        The Intel Smart Sound array on this machine sleeps: an idle capture sits
-        near -76 dBFS and only reaches a usable -24 dBFS once the stream has been
-        open for a moment. Keeping the stream open removes that wake-up from the
-        start of every dictation, at the cost of the microphone being open
-        continuously (Windows shows its microphone-in-use indicator). Set
-        ``keep_mic_warm`` to false to close it between utterances.
+        The Intel Smart Sound array on this machine gates its output when no
+        speech is present: idle capture sits near -84 dBFS and the first one to
+        two seconds of an utterance arrive quietly (down to about -58 dBFS)
+        before the gate opens to a normal -33 dBFS. Keeping the stream open
+        removes the stream-open cost, but it does NOT remove that gate - an aged
+        warm stream still ramps. The pre-roll buffer and
+        :func:`salvage_quiet` exist to stop that quiet onset being dropped. Set
+        ``keep_mic_warm`` to false to close the stream between utterances.
         """
         if self._config.get("keep_mic_warm"):
             self._ensure_stream()
 
     def start(self) -> None:
-        """Begin buffering; opens the stream if it is not already open."""
+        """Begin buffering; opens the stream if it is not already open.
+
+        The buffer is seeded with the pre-roll already captured, so the moments
+        before the keypress - and the latency between keypress and this call -
+        are not lost.
+        """
         if self._recording:
             return
         with self._lock:
-            self._buffer = []
+            self._buffer = list(self._preroll)
             self._samples = 0
             self._last_emit = 0.0
         self._ensure_stream()
@@ -642,6 +680,8 @@ class Recorder:
             sample_rate=self.SAMPLE_RATE,
             adaptive=bool(self._config.get("adaptive_vad")),
         )
+        if trimmed.size == 0:
+            trimmed = salvage_quiet(resampled, sample_rate=self.SAMPLE_RATE)
         if not self._config.get("normalize_audio"):
             return trimmed
         return normalize_level(trimmed)
@@ -665,6 +705,9 @@ class Recorder:
         """Stop and close the current stream, swallowing PortAudio errors."""
         stream = self._stream
         self._stream = None
+        with self._lock:
+            self._preroll.clear()
+            self._preroll_samples = 0
         if stream is None:
             return
         try:
@@ -689,19 +732,30 @@ class Recorder:
         except Exception:
             pass
 
+    def _append_preroll_locked(self, block: np.ndarray) -> None:
+        """Keep the last ``PREROLL_SECONDS`` of audio; caller holds the lock."""
+        self._preroll.append(block)
+        self._preroll_samples += int(block.shape[0])
+        limit = int(PREROLL_SECONDS * self._capture_rate)
+        while self._preroll_samples > limit and len(self._preroll) > 1:
+            self._preroll_samples -= int(self._preroll.popleft().shape[0])
+
     def _callback(
         self, indata: np.ndarray, frames: int, time_info: object, status: object
     ) -> None:
         """Buffer one block and emit a throttled level; never raises."""
         try:
-            if not self._recording:
-                return
             block = indata.copy()
             np.nan_to_num(block, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
             np.clip(block, -1.0, 1.0, out=block)
+            recording = self._recording
             with self._lock:
-                self._buffer.append(block)
-                self._samples += int(block.shape[0])
+                self._append_preroll_locked(block)
+                if recording:
+                    self._buffer.append(block)
+                    self._samples += int(block.shape[0])
+            if not recording:
+                return
             rms = float(np.sqrt(np.mean(np.square(block, dtype=np.float64))))
             level = dbfs_to_level(20.0 * math.log10(max(rms, ENERGY_FLOOR)))
             now = time.perf_counter()

@@ -135,3 +135,49 @@ def test_negative_control_low_threshold_keeps_full_length() -> None:
     signal, _tone_n, _tone_energy = case2_signal()
     result = audio.trim_silence(signal, sample_rate=SAMPLE_RATE, threshold_db=-120.0)
     assert result.size >= signal.size - 2 * HOP
+
+
+def test_quiet_uniform_clip_is_emptied_by_adaptive_trim() -> None:
+    """A flat -45 dBFS clip (a real Intel-array utterance) trims to nothing.
+
+    This is the failure the salvage path fixes: the array delivers a quiet,
+    even utterance, the clip has almost no spread, so ``adaptive_threshold``
+    returns its -40 dBFS ceiling and every frame falls below it. Asserting the
+    empty result here is the negative control for the salvage test below - if
+    adaptive trimming stopped emptying this clip the salvage test would be
+    vacuous.
+    """
+    quiet = _sine(1.0, dbfs=-45.0)
+    assert audio.trim_silence(quiet, adaptive=True).size == 0
+
+
+def test_salvage_quiet_recovers_the_adaptive_emptied_clip() -> None:
+    """The -45 dBFS clip the adaptive trim dropped is recovered by salvage."""
+    quiet = _sine(1.0, dbfs=-45.0)
+    result = audio.salvage_quiet(quiet)
+    assert result.size > 0
+    assert result.dtype == np.float32
+
+
+def test_salvage_quiet_still_drops_true_silence() -> None:
+    """A clip below the -60 dBFS floor is genuinely silent and stays empty."""
+    dead = _sine(1.0, dbfs=-80.0)
+    assert audio.salvage_quiet(dead).size == 0
+    assert audio.salvage_quiet(np.zeros(SAMPLE_RATE, dtype=np.float32)).size == 0
+
+
+def test_preroll_ring_keeps_only_the_last_seconds() -> None:
+    """The always-on buffer is bounded to PREROLL_SECONDS and holds the newest."""
+    rec = audio.Recorder(object(), object())
+    rec._capture_rate = SAMPLE_RATE
+    block = np.zeros(1000, dtype=np.float32)
+    for i in range(40):
+        block = np.full(1000, float(i), dtype=np.float32)
+        rec._append_preroll_locked(block)
+    limit = int(audio.PREROLL_SECONDS * SAMPLE_RATE)
+    assert rec._preroll_samples <= limit
+    assert rec._preroll_samples > limit - 1000
+    newest = np.concatenate(list(rec._preroll))
+    assert float(newest[-1]) == 39.0
+    assert float(newest[0]) == 40.0 - rec._preroll_samples / 1000.0
+

@@ -7,6 +7,16 @@ sounddevice==0.5.6      # microphone capture (bundles PortAudio)
 pynput==1.8.2           # global hotkeys and synthetic input
 numpy==2.4.6            # signal conditioning
 
+# CUDA runtime for the GPU path: transcribe.enable_cuda_dlls() finds these
+# under site-packages/nvidia. CTranslate2 loads cublas64_12.dll and
+# cudnn64_9.dll lazily on the first encode, and they are not bundled with its
+# wheel; without them the GPU path fails on the first dictation. They install
+# on any platform (the app still falls back to CPU without an NVIDIA device),
+# but they are large: on a CPU-only machine, drop these three lines.
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.27.0.42
+nvidia-cuda-nvrtc-cu12==12.9.86
+
 # Optional: used for band-limited resampling when importable. The app falls back
 # to an internal numpy resampler and runs fine without it.
 # scipy

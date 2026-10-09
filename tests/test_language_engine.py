@@ -287,3 +287,26 @@ def test_negative_control_the_gate_is_exact_not_a_substring(make_transcriber, co
     result = engine.transcribe_audio(_audio())
 
     assert result.accepted, result.reject_reason
+
+
+def test_initial_prompt_is_forwarded_when_configured(make_transcriber, config):
+    config.set("language", "en")
+    config.set("initial_prompt", "Technical dictation about GPUs and machine learning.")
+    model = FakeModel()
+    engine = make_transcriber(model)
+
+    engine.transcribe_audio(_audio())
+
+    assert model.transcribe_kwargs[0]["initial_prompt"] == (
+        "Technical dictation about GPUs and machine learning."
+    )
+
+
+def test_no_initial_prompt_is_passed_when_the_setting_is_empty(make_transcriber, config):
+    config.set("language", "en")
+    model = FakeModel()
+    engine = make_transcriber(model)
+
+    engine.transcribe_audio(_audio())
+
+    assert model.transcribe_kwargs[0]["initial_prompt"] is None

@@ -41,6 +41,10 @@ DEFAULTS: dict = {
     "normalize_audio": True,
     "mic_device": None,
     "custom_vocabulary": "",
+    # Extra text prepended to whisper's decode prompt (style / domain priming).
+    # Empty means none: prompt text shifts phrasing style, so it is opt-in and
+    # the plain decode stays the measured default.
+    "initial_prompt": "",
     "save_history": True,
     # 20 was too few: a benchmark run needs its recordings to still exist
     # afterwards, and a second run silently pruned the first one's audio, which

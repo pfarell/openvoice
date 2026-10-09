@@ -531,6 +531,7 @@ dies on a corrupt config.
 | `keep_mic_warm` | `true` | hold the input stream open so a sleeping mic array is awake when you start talking |
 | `mic_device` | `null` | sounddevice index or name substring; null = system default |
 | `custom_vocabulary` | `""` | terms fed as the biasing prompt; empty = no biasing |
+| `initial_prompt` | `""` | extra text prepended to whisper's decode prompt (style / domain priming). It shifts phrasing style (measured: number words come back spelled out), so the plain decode stays the default; set it only when you want that |
 | `learn_threshold` | `2` | sightings before a learned term becomes active |
 | `spoken_punctuation` | `true` | convert spoken punctuation words |
 | `save_history` | `true` | keep the last `history_limit` dictations, audio included |

@@ -13,6 +13,7 @@ import logging
 import math
 import re
 import sys
+import threading
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -194,6 +195,23 @@ def _cuda_device_count() -> int:
         return 0
 
 
+def _probe_encode(model) -> None:
+    """Force one real encode so an engine that cannot compute fails here, not later.
+
+    CTranslate2 loads cublas64_12.dll and cudnn64_9.dll lazily, on the first
+    encode rather than on construction, so a WhisperModel that builds is not
+    proof that inference runs: without those DLLs the failure (or an endless
+    hang, once the runtime had already failed inside the process) used to
+    surface on the first dictation. Consuming the segment generator runs the
+    encode; anything it raises sends load() to the next engine in its fallback
+    list. O(1): one fixed half-second clip, one pass.
+    """
+    probe = np.full(SAMPLE_RATE // 2, 2e-3, dtype=np.float32)
+    segments, _info = model.transcribe(probe, beam_size=1, without_timestamps=True)
+    for _segment in segments:
+        pass
+
+
 def normalise_language_code(value) -> str | None:
     """A lowercase base language code, or None meaning "let the model decide".
 
@@ -295,6 +313,7 @@ class Transcriber:
         self.config = config
         self._model = None
         self._model_key: tuple | None = None
+        self._load_lock = threading.Lock()
         self._beam = int(config.get("beam_size") or DEFAULT_BEAM)
 
     def _key(self) -> tuple:
@@ -366,65 +385,79 @@ class Transcriber:
         A cached model must never hit the network: this machine has a metered
         connection and the app is expected to work with no internet. Only a
         model that is genuinely absent is downloaded, once.
+
+        Every candidate must survive one real encode before it is kept: on CUDA
+        the runtime DLLs load lazily on the first encode, so construction alone
+        proves nothing. The lock keeps the startup warm-up and a decode that
+        arrives during it from constructing the model twice.
         """
         from faster_whisper import WhisperModel
 
         key = self._key()
-        if self._model is not None and self._model_key == key:
-            return
+        with self._load_lock:
+            if self._model is not None and self._model_key == key:
+                return
 
-        beam = int(self.config.get("beam_size") or DEFAULT_BEAM)
-        # The safe CPU fallback must be able to produce every configured language:
-        # small.en cannot emit anything but English, so a non-English setting
-        # falls back to the multilingual small model first, then to small.en.
-        language = normalise_language_code(self.config.get("language"))
-        cpu_model = SMALL_MODEL if language == "en" else SMALL_MULTI_MODEL
-        attempts: list[tuple] = []
-        for attempt in (
-            (*key, beam),
-            (cpu_model, "cpu", "int8", _FALLBACK_BEAM),
-            (SMALL_MODEL, "cpu", "int8", _FALLBACK_BEAM),
-        ):
-            if attempt not in attempts:
-                attempts.append(attempt)
-        last_error: Exception | None = None
-        for model_name, device, compute_type, attempt_beam in attempts:
-            if device == "cuda":
-                enable_cuda_dlls()
-            try:
-                self._model = WhisperModel(
-                    model_name, device=device, compute_type=compute_type,
-                    local_files_only=True,
+            beam = int(self.config.get("beam_size") or DEFAULT_BEAM)
+            # The safe CPU fallback must be able to produce every configured
+            # language: small.en cannot emit anything but English, so a
+            # non-English setting falls back to the multilingual small model
+            # first, then to small.en.
+            language = normalise_language_code(self.config.get("language"))
+            cpu_model = SMALL_MODEL if language == "en" else SMALL_MULTI_MODEL
+            attempts: list[tuple] = []
+            for attempt in (
+                (*key, beam),
+                (cpu_model, "cpu", "int8", _FALLBACK_BEAM),
+                (SMALL_MODEL, "cpu", "int8", _FALLBACK_BEAM),
+            ):
+                if attempt not in attempts:
+                    attempts.append(attempt)
+            last_error: Exception | None = None
+            for model_name, device, compute_type, attempt_beam in attempts:
+                if device == "cuda":
+                    enable_cuda_dlls()
+                try:
+                    candidate = WhisperModel(
+                        model_name, device=device, compute_type=compute_type,
+                        local_files_only=True,
+                    )
+                    _probe_encode(candidate)
+                except Exception as exc:
+                    last_error = exc
+                    log.warning(
+                        "engine %s on %s/%s failed (%s); trying the fallback",
+                        model_name, device, compute_type, exc,
+                    )
+                    continue
+                self._model = candidate
+                self._model_key = (model_name, device, compute_type)
+                self._beam = attempt_beam
+                log.info(
+                    "engine: %s on %s/%s, beam %s",
+                    model_name, device, compute_type, attempt_beam,
                 )
-            except Exception as exc:
-                last_error = exc
-                log.warning(
-                    "engine %s on %s/%s failed (%s); trying the fallback",
-                    model_name, device, compute_type, exc,
-                )
-                continue
-            self._model_key = (model_name, device, compute_type)
-            self._beam = attempt_beam
-            log.info(
-                "engine: %s on %s/%s, beam %s",
-                model_name, device, compute_type, attempt_beam,
+                return
+
+            raise RuntimeError(
+                f"no usable speech model: {last_error}. If a model is genuinely absent, "
+                "download it deliberately with: python tools/fetch_model.py --model small"
             )
-            return
-
-        raise RuntimeError(
-            f"no usable speech model: {last_error}. If a model is genuinely absent, "
-            "download it deliberately with: python tools/fetch_model.py --model small"
-        )
 
     def warm_up(self) -> None:
-        """Load the model and decode one silent second so the first dictation is not slow.
+        """Load the model and decode one quiet second so the first dictation is not slow.
 
-        Failures are reported on the bus rather than raised: this runs on a
-        background thread at startup and must not take the app down.
+        The buffer must not be digital silence: transcribe_audio rejects that
+        before it ever touches the model, so the previous zeros warmed nothing.
+        A quiet constant passes the gates and runs the real decode path, which
+        is also what turns a broken engine into a startup notification instead
+        of a surprise during the first dictation. Failures are reported on the
+        bus rather than raised: this runs on a background thread at startup and
+        must not take the app down.
         """
         try:
             self.load()
-            self.transcribe_audio(np.zeros(SAMPLE_RATE, dtype=np.float32))
+            self.transcribe_audio(np.full(SAMPLE_RATE, 2e-3, dtype=np.float32))
         except Exception as exc:
             log.exception("warm-up failed")
             self.bus.transcription_error.emit(f"Speech model failed to load: {exc}")
@@ -434,6 +467,21 @@ class Transcriber:
         return self.transcribe_audio(audio).text
 
     def transcribe_audio(self, audio: np.ndarray) -> Result:
+        """Transcribe one clip, and never keep a model that just failed.
+
+        If the engine raises mid-inference (a lost CUDA context, a driver
+        reset), the instance is dropped so the next call goes back through
+        load() and its fallback list instead of reusing a broken model. The
+        failure itself is re-raised for the caller to report.
+        """
+        try:
+            return self._transcribe(audio)
+        except Exception:
+            self._model = None
+            self._model_key = None
+            raise
+
+    def _transcribe(self, audio: np.ndarray) -> Result:
         """Transcribe and decide whether the result is trustworthy.
 
         Blocking; call from a worker thread. A result is REJECTED rather than
@@ -453,6 +501,7 @@ class Transcriber:
 
         self.load()
         chosen_language, detected_probability, language_detected = self._resolve_language(audio)
+        initial_prompt = (self.config.get("initial_prompt") or "").strip()
         segments, info = self._model.transcribe(
             audio,
             language=chosen_language,
@@ -468,6 +517,7 @@ class Transcriber:
                 speech_pad_ms=200,
                 max_speech_duration_s=MAX_WINDOW_SECONDS - 2.0,
             ),
+            initial_prompt=initial_prompt or None,
             hotwords=hotwords_for(self.config, chosen_language or "") or None,
             no_speech_threshold=NO_SPEECH_PROB,
             log_prob_threshold=BAD_LOGPROB,

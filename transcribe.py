@@ -9,6 +9,7 @@ scales super-linearly with audio length.
 
 from __future__ import annotations
 
+import bisect
 import logging
 import math
 import re
@@ -56,6 +57,113 @@ _FALLBACK_BEAM = 1
 # A window longer than 30 s silently degrades: whisper was trained on 30 s
 # chunks and slides a 30 s window, so a bad window poisons its successor.
 MAX_WINDOW_SECONDS = 30.0
+
+# Longest piece handed to whisper in one decode, and how far either side of an
+# even split the cut may move to find a pause. Decoding a full 30 s window
+# without timestamps drops whole sentences (measured by tools/long_bench.py),
+# and a fixed 30 s step cuts words in half, so long clips are split into even
+# pieces at their quietest moment instead. Cutting at the latest pause rather
+# than near an even split was measured worse (5.83% vs 3.85% WER): it makes
+# pieces close to 28 s, and those are the ones whisper truncates.
+CHUNK_SECONDS = 28.0
+CUT_SEARCH_SECONDS = 10.0
+
+# A piece whose words per voiced second fall below this share of its siblings'
+# median was truncated: prompted with the hotwords sentence, whisper sometimes
+# ends a piece early and skips its last sentences (laptop clip 36 in
+# tools/long_bench.py: 16 words with hotwords, 47 without). Healthy pieces
+# measured 0.67 or more of the median; truncated ones 0.37-0.52. Such a piece is
+# decoded again on its own without hotwords, and the retry is kept only when it
+# recovers a clear number of words.
+DROP_RATE_RATIO = 0.6
+DROP_MIN_VOICED_SECONDS = 3.0
+DROP_MIN_GAIN = 0.15
+
+
+def _smoothed_energy(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+    """Mean power of 10 ms frames, smoothed over 100 ms. Time and space O(n)."""
+    hop = sample_rate // 100
+    frames = audio.size // hop
+    if frames == 0:
+        return np.zeros(0)
+    energy = np.square(audio[: frames * hop].astype(np.float64)).reshape(frames, hop).mean(axis=1)
+    return np.convolve(energy, np.ones(10) / 10.0, mode="same")
+
+
+def voiced_frames(smooth: np.ndarray) -> np.ndarray:
+    """Boolean mask of 10 ms frames clearly above the clip's noise floor.
+
+    A clip without a quiet floor (four times below its median) has no pauses
+    to tell apart, so every frame counts as voiced. Time and space O(n).
+    """
+    if smooth.size == 0:
+        return np.zeros(0, dtype=bool)
+    floor = float(np.percentile(smooth, 1))
+    middle = float(np.median(smooth))
+    if middle <= 4.0 * floor:
+        return np.ones(smooth.size, dtype=bool)
+    return smooth > floor + 0.15 * (middle - floor)
+
+
+def silence_cuts(
+    audio: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    max_seconds: float = CHUNK_SECONDS,
+    search_seconds: float = CUT_SEARCH_SECONDS,
+) -> list[float] | None:
+    """faster-whisper ``clip_timestamps`` that split ``audio`` at pauses.
+
+    Returns None when the clip fits one piece. Otherwise a flat
+    ``[start, end, start, end, ...]`` list in seconds of the fewest pieces of
+    at most ``max_seconds``, each cut aimed at an even split of what is left
+    and moved to the quietest 100 ms within ``search_seconds`` of that aim.
+    Time and space O(n).
+    """
+    smooth = _smoothed_energy(audio, sample_rate)
+    frames = smooth.size
+    total = audio.size / sample_rate
+    if total <= max_seconds or frames == 0:
+        return None
+    limit = int(max_seconds * 100)
+    reach = max(1, int(search_seconds * 100))
+    points = [0.0]
+    cursor = 0
+    while frames - cursor > limit:
+        remaining = frames - cursor
+        count = math.ceil(remaining / limit)
+        target = cursor + remaining // count
+        low = max(cursor + 1, target - reach // 2, frames - (count - 1) * limit)
+        high = min(cursor + limit, target + reach // 2)
+        cut = low + int(np.argmin(smooth[low : high + 1]))
+        points.extend([cut / 100.0, cut / 100.0])
+        cursor = cut
+    points.append(total)
+    return points
+
+
+def truncated_pieces(audio: np.ndarray, cuts: list[float], words: list[int]) -> list[int]:
+    """Indices of pieces whose decode is much sparser than their siblings'.
+
+    ``words`` holds the decoded word count of each piece of ``cuts``. Each
+    piece is compared with the median rate of the other pieces, because with
+    two pieces a median that includes the piece itself hides the drop. Time
+    O(n + p^2 log p) for n samples and p pieces; p is the dictation length over
+    ~25 s, so the all-pairs part stays tiny. Space O(n).
+    """
+    voiced = voiced_frames(_smoothed_energy(audio))
+    spans = list(zip(cuts[0::2], cuts[1::2]))
+    seconds = [float(voiced[int(a * 100) : int(b * 100)].sum()) / 100.0 for a, b in spans]
+    rates = [
+        count / voiced_seconds if voiced_seconds >= DROP_MIN_VOICED_SECONDS else None
+        for count, voiced_seconds in zip(words, seconds)
+    ]
+    flagged = []
+    for index, rate in enumerate(rates):
+        others = [other for position, other in enumerate(rates) if position != index and other is not None]
+        if rate is not None and others and rate < DROP_RATE_RATIO * float(np.median(others)):
+            flagged.append(index)
+    return flagged
+
 
 # Whisper hallucinates on non-speech. Barański 2025 (arXiv:2501.11378) measured
 # 40.3% of 301,317 non-speech clips producing text, and the training-data
@@ -481,6 +589,30 @@ class Transcriber:
             self._model_key = None
             raise
 
+    def _retry_truncated(self, audio: np.ndarray, cuts: list[float], segments: list, decode: dict) -> list:
+        """Re-decode pieces that ``truncated_pieces`` flags, each on its own.
+
+        A segment belongs to the piece its start falls in. The retry drops the
+        hotwords prompt, which is what made whisper end the piece early, and it
+        replaces the piece only when it adds ``DROP_MIN_GAIN`` more words (at
+        least three). O(segments log pieces) plus one decode per flagged piece.
+        """
+        starts = cuts[0::2]
+        groups: list[list] = [[] for _ in starts]
+        for segment in segments:
+            index = bisect.bisect_right(starts, float(getattr(segment, "start", 0.0)) + 1e-3) - 1
+            groups[max(0, index)].append(segment)
+        counts = [sum(len(segment.text.split()) for segment in group) for group in groups]
+        for index in truncated_pieces(audio, cuts, counts):
+            span = [cuts[2 * index], cuts[2 * index + 1]]
+            retry, _ = self._model.transcribe(audio, clip_timestamps=span, condition_on_previous_text=False, **{**decode, "hotwords": None})
+            retry = list(retry)
+            gained = sum(len(segment.text.split()) for segment in retry)
+            if gained >= counts[index] + max(3, DROP_MIN_GAIN * counts[index]):
+                log.info("re-decoded truncated piece %.1f-%.1f s: %d -> %d words", *span, counts[index], gained)
+                groups[index] = retry
+        return [segment for group in groups for segment in group]
+
     def _transcribe(self, audio: np.ndarray) -> Result:
         """Transcribe and decide whether the result is trustworthy.
 
@@ -502,14 +634,14 @@ class Transcriber:
         self.load()
         chosen_language, detected_probability, language_detected = self._resolve_language(audio)
         initial_prompt = (self.config.get("initial_prompt") or "").strip()
-        segments, info = self._model.transcribe(
-            audio,
+        vad_filter = bool(self.config.get("vad_filter", False))
+        cuts = None if vad_filter else silence_cuts(audio)
+        decode = dict(
             language=chosen_language,
             multilingual=bool(self.config.get("detect_per_segment")),
             beam_size=self._beam,
-            condition_on_previous_text=bool(self.config.get("condition_on_previous", True)),
             prompt_reset_on_temperature=0.5,
-            vad_filter=bool(self.config.get("vad_filter", False)),
+            vad_filter=vad_filter,
             vad_parameters=dict(
                 threshold=0.5,
                 min_speech_duration_ms=250,
@@ -525,6 +657,14 @@ class Transcriber:
             word_timestamps=False,
             without_timestamps=True,
         )
+        segments, info = self._model.transcribe(
+            audio,
+            clip_timestamps=cuts or "0",
+            condition_on_previous_text=bool(self.config.get("condition_on_previous", True)),
+            **decode,
+        )
+        if cuts:
+            segments = self._retry_truncated(audio, cuts, list(segments), decode)
 
         pieces = []
         logprobs = []

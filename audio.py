@@ -81,8 +81,10 @@ _TINY_POWER = 1e-30
 _AMPLITUDE_FLOOR = 1e-12
 
 try:
+    from scipy.signal import lfilter as _scipy_lfilter
     from scipy.signal import resample_poly as _scipy_resample_poly
 except Exception:
+    _scipy_lfilter = None
     _scipy_resample_poly = None
 
 
@@ -276,7 +278,8 @@ def highpass_rumble(
     laptop array picks up. The filter is a biquad (Q = 1/sqrt(2)) built from the
     standard bilinear coefficients and run in direct form I. DC is removed
     exactly, 50 Hz room rumble is attenuated about 9 dB, and the response is
-    -3 dB at ``cutoff_hz``.
+    -3 dB at ``cutoff_hz``. ``scipy.signal.lfilter`` runs the same recurrence
+    in C when scipy is importable; the Python loop is the fallback.
 
     Time: O(n) in the sample count - one arithmetic pass. Space: O(n) for the
     returned array.
@@ -299,6 +302,9 @@ def highpass_rumble(
     b2 /= a0
     a1 /= a0
     a2 /= a0
+    if _scipy_lfilter is not None:
+        out = _scipy_lfilter([b0, b1, b2], [1.0, a1, a2], arr.astype(np.float64))
+        return np.clip(out, -1.0, 1.0).astype(np.float32, copy=False)
     out = np.empty(n, dtype=np.float64)
     x1 = x2 = y1 = y2 = 0.0
     for i in range(n):
@@ -497,6 +503,24 @@ def salvage_quiet(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarr
     )
 
 
+def condition_capture(
+    captured: np.ndarray, capture_rate: int, adaptive: bool = True, normalize: bool = True
+) -> np.ndarray:
+    """Turn a raw capture into the 16 kHz clip the recogniser is given.
+
+    The single conditioning chain shared by :meth:`Recorder.stop` and the
+    benchmarks, so a benchmark measures exactly what a dictation goes through:
+    rumble high-pass, resample, silence trim (quiet-clip salvage when the trim
+    finds nothing), then level normalisation. Time and space O(n).
+    """
+    filtered = highpass_rumble(captured, capture_rate)
+    resampled = resample_to(filtered, capture_rate, SAMPLE_RATE)
+    trimmed = trim_silence(resampled, sample_rate=SAMPLE_RATE, adaptive=adaptive)
+    if trimmed.size == 0:
+        trimmed = salvage_quiet(resampled, sample_rate=SAMPLE_RATE)
+    return normalize_level(trimmed) if normalize else trimmed
+
+
 def dbfs_to_level(db: float, floor_db: float = MIN_LEVEL_DB) -> float:
     """Map a dBFS value onto 0.0..1.0 with clamping.
 
@@ -672,19 +696,12 @@ class Recorder:
             self._close_stream()
         if not chunks:
             return np.empty(0, dtype=np.float32)
-        captured = np.concatenate(chunks).reshape(-1)
-        filtered = highpass_rumble(captured, self._capture_rate)
-        resampled = resample_to(filtered, self._capture_rate, self.SAMPLE_RATE)
-        trimmed = trim_silence(
-            resampled,
-            sample_rate=self.SAMPLE_RATE,
+        return condition_capture(
+            np.concatenate(chunks).reshape(-1),
+            self._capture_rate,
             adaptive=bool(self._config.get("adaptive_vad")),
+            normalize=bool(self._config.get("normalize_audio")),
         )
-        if trimmed.size == 0:
-            trimmed = salvage_quiet(resampled, sample_rate=self.SAMPLE_RATE)
-        if not self._config.get("normalize_audio"):
-            return trimmed
-        return normalize_level(trimmed)
 
     def cancel(self) -> None:
         """Discard everything captured; resets state."""

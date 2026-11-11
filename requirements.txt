@@ -17,6 +17,6 @@ nvidia-cublas-cu12==12.9.2.10
 nvidia-cudnn-cu12==9.27.0.42
 nvidia-cuda-nvrtc-cu12==12.9.86
 
-# Optional: used for band-limited resampling when importable. The app falls back
-# to an internal numpy resampler and runs fine without it.
-# scipy
+# Resampling and the rumble high-pass run in C with it: a 60 s capture conditions
+# in ~0.08 s instead of ~2.3 s. The app still falls back to numpy without it.
+scipy==1.17.1           # BSD-3-Clause

@@ -100,7 +100,7 @@ def adaptive_threshold(
     frame_dbs: np.ndarray,
     absolute_db: float = -40.0,
     margin_db: float = 10.0,
-    min_gate_db: float = -60.0,
+    min_gate_db: float = -75.0,
     min_spread_db: float = 6.0,
 ) -> float:
     """Derive a speech threshold from the clip's own noise floor.
@@ -108,7 +108,9 @@ def adaptive_threshold(
     One absolute threshold cannot serve both a low-gain laptop array and a loud
     headset. Measured on this machine, the Intel microphone array sits around
     -76 dBFS RMS with peaks near -54 dBFS, so ordinary speech can land close to
-    -40 dBFS and be discarded as silence.
+    -40 dBFS and be discarded as silence. Talking from 50-60 cm in a quiet room
+    puts the floor near -82 dBFS and soft words near -68 dBFS, so a -60 dBFS
+    lower clamp cut sentence endings; ``min_gate_db`` is -75 for that case.
 
     The 20th percentile of the frame levels estimates the noise floor; the
     threshold sits ``margin_db`` above it and is clamped to

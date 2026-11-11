@@ -181,3 +181,20 @@ def test_preroll_ring_keeps_only_the_last_seconds() -> None:
     assert float(newest[-1]) == 39.0
     assert float(newest[0]) == 40.0 - rec._preroll_samples / 1000.0
 
+
+
+def test_distant_speech_tail_survives_a_quiet_room() -> None:
+    """Speech from across the room fades below -60 dBFS and must not be cut.
+
+    Talking from 50 cm or more in a quiet room puts the noise floor near -82
+    dBFS and the softer words around -68 dBFS. A gate clamped at -60 dBFS cut
+    those words off the end of the dictation; tools/long_bench.py at -64 dBFS
+    speech measured 9.25% WER with the clamp and 4.56% without it.
+    """
+    rng = np.random.default_rng(0)
+    floor = lambda s: (10 ** (-82 / 20) * rng.standard_normal(int(s * SAMPLE_RATE))).astype(np.float32)
+    voice = lambda s, db: (10 ** (db / 20) * rng.standard_normal(int(s * SAMPLE_RATE))).astype(np.float32)
+    clip = np.concatenate([floor(1.0), voice(1.0, -58.0), voice(1.0, -68.0), floor(1.0)])
+    kept = audio.trim_silence(clip, sample_rate=SAMPLE_RATE, adaptive=True)
+    assert kept.size >= int(2.0 * SAMPLE_RATE)
+    assert kept.size <= int(2.4 * SAMPLE_RATE)

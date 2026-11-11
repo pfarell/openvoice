@@ -6,7 +6,9 @@ sees: short single sentences and long 40-70 s dictations made of several
 sentences joined by natural pauses. Each utterance is rendered twice at the
 laptop array's native 44.1 kHz: ``clean`` (healthy level, no noise) and
 ``laptop`` (quiet level, background noise, mains hum, DC offset, a wake-gate
-attenuated onset and a hotkey click). Both go through the app's real
+attenuated onset and a hotkey click) and ``far`` (talking from 50-60 cm: 8 dB
+quieter than ``laptop``, room reverb, and the quiet room the saved dictations
+show, about 18 dB below the speech). Both go through the app's real
 conditioning chain (:func:`audio.condition_capture`) and recogniser
 (:meth:`transcribe.Transcriber.transcribe_audio`) with the user's own language
 and vocabulary settings, read from their config without writing it.
@@ -29,6 +31,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+from scipy.signal import fftconvolve
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -41,6 +44,11 @@ from lang_bench import sample_dir, score  # noqa: E402
 
 CAPTURE_RATE = 44100
 RUNS_DIR = TOOLS / "runs"
+FAR_SPEECH_DBFS = -52.0
+FAR_NOISE_DBFS = -70.0
+FAR_RT60 = 0.45
+FAR_DRR_DB = 0.0
+CONDITIONS = ("clean", "laptop", "far")
 COPIED_SETTINGS = ("language", "custom_vocabulary", "initial_prompt", "model_name", "beam_size")
 
 
@@ -81,6 +89,17 @@ def build_utterances(clips, rng, long_count: int) -> list[dict]:
     return items
 
 
+def room_response(rng, rt60: float = FAR_RT60, drr_db: float = FAR_DRR_DB) -> np.ndarray:
+    """Direct path plus an exponentially decaying diffuse tail (60 dB down at ``rt60``)."""
+    n = int(rt60 * CAPTURE_RATE)
+    t = np.arange(n) / CAPTURE_RATE
+    tail = rng.standard_normal(n) * np.exp(-np.log(1000.0) * t / rt60)
+    tail[: int(0.003 * CAPTURE_RATE)] = 0.0
+    tail *= 10 ** (-drr_db / 20) / np.sqrt(np.sum(tail**2))
+    tail[0] = 1.0
+    return tail
+
+
 def render(item: dict, condition: str, rng) -> np.ndarray:
     """The 44.1 kHz capture the microphone would deliver for ``item``."""
     pieces = [np.zeros(int(0.4 * 16000), dtype=np.float32)]
@@ -97,8 +116,16 @@ def render(item: dict, condition: str, rng) -> np.ndarray:
     rms = float(np.sqrt(np.mean(active**2))) if active.size else 1.0
     if condition == "clean":
         return (speech * (10 ** (-24 / 20) / rms)).astype(np.float32)
-    speech *= 10 ** (-44 / 20) / rms
     level = 10 ** (-44 / 20)
+    noise_db = -12.0
+    if condition == "far":
+        voiced = np.abs(speech) > 1e-4
+        speech = fftconvolve(speech, room_response(rng))[:n_out]
+        rms = float(np.sqrt(np.mean(speech[voiced] ** 2))) if voiced.any() else 1.0
+        speech *= 10 ** (FAR_SPEECH_DBFS / 20) / rms
+        noise_db = FAR_NOISE_DBFS + 44.0
+    else:
+        speech *= level / rms
     onset = int(0.4 * CAPTURE_RATE)
     gate = np.ones(n_out)
     gate[onset : onset + int(0.35 * CAPTURE_RATE)] = np.linspace(0.08, 1.0, int(0.35 * CAPTURE_RATE))
@@ -107,8 +134,8 @@ def render(item: dict, condition: str, rng) -> np.ndarray:
     freqs = np.fft.rfftfreq(n_out, 1 / CAPTURE_RATE)
     spectrum /= np.sqrt(np.maximum(freqs, 20.0))
     noise = np.fft.irfft(spectrum, n_out)
-    noise *= level * 10 ** (-12 / 20) / np.sqrt(np.mean(noise**2))
-    hum = 0.3 * level * np.sin(2 * np.pi * 50.0 * t_out)
+    noise *= level * 10 ** (noise_db / 20) / np.sqrt(np.mean(noise**2))
+    hum = 0.3 * level * 10 ** ((noise_db + 12.0) / 20) * np.sin(2 * np.pi * 50.0 * t_out)
     click = np.zeros(n_out)
     start = int(0.05 * CAPTURE_RATE)
     length = int(0.004 * CAPTURE_RATE)
@@ -135,7 +162,8 @@ def make_config(tmp: Path, model: str | None):
     return defaults
 
 
-def run(label: str, long_count: int, seed: int, model: str | None, limit: int | None) -> int:
+def run(label: str, long_count: int, seed: int, model: str | None, limit: int | None,
+        conditions=CONDITIONS) -> int:
     import audio as audio_module
     import transcribe
     from bus import Bus
@@ -156,7 +184,7 @@ def run(label: str, long_count: int, seed: int, model: str | None, limit: int | 
         transcriber.load()
         transcriber.transcribe_audio(np.zeros(16000, dtype=np.float32) + 1e-3)
         rows = []
-        for condition in ("clean", "laptop"):
+        for condition in conditions:
             render_rng = np.random.default_rng(seed + 1)
             for number, item in enumerate(items):
                 captured = render(item, condition, render_rng)
@@ -236,8 +264,9 @@ def main(argv=None) -> int:
     parser.add_argument("--seed", type=int, default=20261110)
     parser.add_argument("--model", default=None)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--conditions", nargs="+", choices=CONDITIONS, default=list(CONDITIONS))
     args = parser.parse_args(argv)
-    return run(args.label, args.long_count, args.seed, args.model, args.limit)
+    return run(args.label, args.long_count, args.seed, args.model, args.limit, args.conditions)
 
 
 if __name__ == "__main__":
